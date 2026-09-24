@@ -142,6 +142,19 @@ function setup(t, pubkey, fetch = () => []) {
   return relay;
 }
 
+/** Holds every publish at `boundary` ("encrypt" or "sign") until `gate`. */
+function holdAt(relay, boundary, gate) {
+  if (boundary === "encrypt") {
+    relay.encryptGate = gate;
+    return;
+  }
+  const invoke = window.__TAURI_INTERNALS__.invoke;
+  window.__TAURI_INTERNALS__.invoke = async (cmd, args) => {
+    if (cmd === "sign_event") await gate;
+    return invoke(cmd, args);
+  };
+}
+
 /** Records the sync manager a hook constructs, via its `bootstrap` call. */
 function captureManager(t, Manager) {
   const orig = Manager.prototype.bootstrap;
@@ -714,6 +727,8 @@ for (const lane of [
     cache: (pk) =>
       sectionNames(sections.readChannelSectionsStore(pk, RELAY)).join(),
     adopted: "Remote",
+    later: sectionsPayload("Later"),
+    laterUi: "Later",
   },
   {
     name: "useChannelSortPreference",
@@ -730,6 +745,8 @@ for (const lane of [
     cache: (pk) =>
       Object.keys(sort.readChannelSortStore(pk, RELAY).groups).join(),
     adopted: "dms",
+    later: { version: 1, groups: { channels: "recent" } },
+    laterUi: "channels",
   },
 ]) {
   test(`${lane.name} bootstrap seed yields to a head observed after it was queued`, async (t) => {
@@ -753,9 +770,9 @@ for (const lane of [
     await act(async () => recovery.resolve(remote));
     await flush();
 
-    await tick(t, 2_000); // seed debounce → prepublish read returns R
+    await tick(t, 2_000); // seed debounce
     await until(
-      () => relay.fetches === 3 && manager.current.getPendingStore() === null,
+      () => manager.current.getPendingStore() === null,
       "seed was not abandoned",
     );
     assert.equal(relay.published.length, 0, "seed overwrote the remote head");
@@ -770,6 +787,107 @@ for (const lane of [
     await tick(t, 2_000);
     await flush();
     assert.equal(relay.published.length, 0, "seed republished");
+  });
+
+  for (const boundary of ["encrypt", "sign"]) {
+    test(`${lane.name} bootstrap seed yields to a head recorded during ${boundary}`, async (t) => {
+      const pk = `pk-seed-${boundary}-${lane.dTag}`;
+      const boot = deferred();
+      const recovery = deferred();
+      const gate = deferred();
+      const manager = captureManager(t, lane.Manager());
+      const remote = [relayEvent(pk, lane.dTag, 3000, lane.remote)];
+      const relay = setup(t, pk, (n) =>
+        n === 1 ? boot.promise : n === 2 ? recovery.promise : [],
+      );
+      holdAt(relay, boundary, gate.promise);
+      window.localStorage.setItem(lane.key(pk), JSON.stringify(lane.seed));
+      const { result } = renderHook(() => lane.render(pk));
+      await until(() => relay.fetches === 2, "mount reads not in flight");
+      await act(async () => boot.resolve([]));
+      await until(
+        () => manager.current.getPendingStore() !== null,
+        "bootstrap did not seed",
+      );
+      await tick(t, 2_000); // debounce → prepublish [] → held at boundary
+      await until(() => relay.fetches === 3, "prepublish did not run");
+      await flush();
+      await act(async () => recovery.resolve(remote));
+      await flush();
+      await act(async () => gate.resolve());
+      await flush();
+      assert.equal(relay.published.length, 0, "seed overwrote the head");
+      assert.equal(manager.current.getPendingStore(), null, "seed pending");
+      relay.fetch = () => remote;
+      await tick(t, 5_000);
+      await until(
+        () =>
+          lane.ui(result) === lane.adopted && lane.cache(pk) === lane.adopted,
+        "remote head not adopted",
+      );
+    });
+  }
+
+  test(`${lane.name} requeued bootstrap seed still yields to a later head`, async (t) => {
+    const pk = `pk-seed-requeue-${lane.dTag}`;
+    const gate = deferred();
+    const manager = captureManager(t, lane.Manager());
+    const remote = [relayEvent(pk, lane.dTag, 3000, lane.remote)];
+    const relay = setup(t, pk, () => []);
+    window.localStorage.setItem(lane.key(pk), JSON.stringify(lane.seed));
+    const { result } = renderHook(() => lane.render(pk));
+    await until(
+      () => manager.current?.getPendingStore() != null,
+      "bootstrap did not seed",
+    );
+    const seed = manager.current.getPendingStore();
+    // Reconnect read sees no head, so the same pending seed is requeued.
+    relay.fetch = () => {
+      throw new Error("relay down");
+    };
+    await act(async () => relay.reconnect());
+    await flush();
+    assert.equal(manager.current.getPendingStore(), seed, "seed not requeued");
+    relay.fetch = () => [];
+    relay.encryptGate = gate.promise;
+    await tick(t, 2_000); // requeued debounce → prepublish [] → held encrypt
+    await flush();
+    relay.fetch = () => remote;
+    await act(async () => relay.reconnect()); // records R mid-encrypt
+    await flush();
+    await act(async () => gate.resolve());
+    await flush();
+    assert.equal(relay.published.length, 0, "requeued seed overwrote the head");
+    await tick(t, 10_000);
+    await until(
+      () => lane.ui(result) === lane.adopted && lane.cache(pk) === lane.adopted,
+      "remote head not adopted",
+    );
+  });
+
+  test(`${lane.name} reconnect-cancelled seed does not stall later recovery`, async (t) => {
+    const pk = `pk-seed-stall-${lane.dTag}`;
+    const manager = captureManager(t, lane.Manager());
+    const relay = setup(t, pk, () => []);
+    window.localStorage.setItem(lane.key(pk), JSON.stringify(lane.seed));
+    const { result } = renderHook(() => lane.render(pk));
+    await until(
+      () => manager.current?.getPendingStore() != null,
+      "bootstrap did not seed",
+    );
+    relay.fetch = () => [relayEvent(pk, lane.dTag, 3000, lane.remote)];
+    await act(async () => relay.reconnect()); // during the seed debounce
+    await flush();
+    await tick(t, 2_000);
+    await flush();
+    assert.equal(lane.ui(result), lane.adopted, "first head not applied");
+    assert.equal(relay.published.length, 0, "seed published over the head");
+    relay.fetch = () => [relayEvent(pk, lane.dTag, 4000, lane.later)];
+    for (const ms of [5_000, 10_000, 30_000, 60_000]) await tick(t, ms);
+    await until(
+      () => lane.ui(result) === lane.laterUi && lane.cache(pk) === lane.laterUi,
+      "stuck seed blocked later recovery",
+    );
   });
 
   test(`${lane.name} bootstrap seed publishes when no head appears`, async (t) => {

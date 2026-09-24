@@ -97,6 +97,13 @@ export class ChannelSectionSyncManager {
       this.lastRemoteCreatedAt = createdAt;
     }
     advanceWatermark(this.pubkey, BLOB_TYPE, this.relayUrl, createdAt);
+    // An observed head supersedes the absence-based seed, so it stops being
+    // pending: recovery must not keep skipping reads for a seed whose timer
+    // a remote apply may already have cancelled.  Real edits are untouched.
+    if (this.pendingStore !== null && this.pendingStore === this.seedStore) {
+      this.cancelPendingPublish();
+      this.pendingStore = null;
+    }
   }
 
   cancelPendingPublish(): void {
@@ -217,6 +224,12 @@ export class ChannelSectionSyncManager {
       // synchronous-ish but cheap; the relay socket may have moved to a
       // different community by the time we reach this point.
       if (this.destroyed) return;
+      // Re-check after the async encrypt/sign: a head recorded meanwhile
+      // still supersedes the seed.
+      if (store === this.seedStore && this.lastRemoteCreatedAt > 0) {
+        if (this.pendingStore === store) this.pendingStore = null;
+        return;
+      }
       await relayClient.publishEvent(
         event,
         "Timed out publishing channel sections.",
