@@ -59,11 +59,10 @@ export class ChannelMuteSyncManager {
   private debounceTimer: number | null = null;
   private lastRemoteCreatedAt: number;
   private pendingStore: ChannelMuteStore | null = null;
-  private lastPublishedStore: ChannelMuteStore | null = null;
-  /** Event id of our publication of `lastPublishedStore`. */
-  private lastPublishedHeadId: string | null = null;
   /** The canonical relay head observed so far. */
   private head: HeadId | null = null;
+  /** Decoded content of `head`; null while it is unknown or undecodable. */
+  private headStore: ChannelMuteStore | null = null;
   /**
    * The bootstrap seed, queued because the relay had no head, unioned with
    * every canonical head decoded since (`seedHead`).  Non-null exactly while
@@ -116,7 +115,10 @@ export class ChannelMuteSyncManager {
       this.lastRemoteCreatedAt = event.created_at;
     }
     advanceWatermark(this.pubkey, BLOB_TYPE, this.relayUrl, event.created_at);
-    if (beats(headOf(event), this.head)) this.head = headOf(event);
+    if (beats(headOf(event), this.head)) {
+      this.head = headOf(event);
+      this.headStore = null; // until this head's own content is decoded
+    }
   }
 
   /**
@@ -124,8 +126,10 @@ export class ChannelMuteSyncManager {
    * re-arms the seed job, so the seed never publishes without it.  A head
    * that cannot be decoded cannot be folded, so the seed is abandoned rather
    * than published over it; its entries stay in the local cache only.
+   * Also records the decoded content of the canonical head (`headStore`).
    */
   private foldIntoSeed(head: HeadId, remote: ChannelMuteStore | null): void {
+    if (remote !== null && this.head?.id === head.id) this.headStore = remote;
     if (this.seedStore === null || this.head?.id !== head.id) return;
     if (this.seedHead?.id === head.id) return;
     this.seedGen++;
@@ -160,15 +164,12 @@ export class ChannelMuteSyncManager {
       this.arm(store, this.seedGen); // reconnect requeue keeps provenance
       return;
     }
-    // A real edit supersedes the seed: any seed job becomes obsolete, but the
-    // edit carries the seed's union forward (the edit's entries are newer).
-    let edit = store;
+    // A real edit supersedes the seed: any seed job becomes obsolete.
     if (this.seedStore !== null) {
-      edit = mergeStores(store, this.seedStore);
       this.seedStore = null;
       this.seedGen++;
     }
-    this.arm(edit, null);
+    this.arm(store, null);
   }
 
   /** `gen` is the seed generation a seed job was armed with; null for edits. */
@@ -204,15 +205,15 @@ export class ChannelMuteSyncManager {
     }
   }
 
-  private isIdenticalToLastPublished(store: ChannelMuteStore): boolean {
-    // Only our own publication at the canonical head represents the relay.
-    if (!this.lastPublishedStore) return false;
-    if (this.head?.id !== this.lastPublishedHeadId) return false;
-    const lastKeys = Object.keys(this.lastPublishedStore.channels);
+  /** True when the canonical head's decoded content already equals `store`. */
+  private isRepresentedByHead(store: ChannelMuteStore): boolean {
+    const head = this.headStore;
+    if (!head) return false;
+    const headKeys = Object.keys(head.channels);
     const currentKeys = Object.keys(store.channels);
-    if (lastKeys.length !== currentKeys.length) return false;
+    if (headKeys.length !== currentKeys.length) return false;
     for (const key of currentKeys) {
-      const last = this.lastPublishedStore.channels[key];
+      const last = head.channels[key];
       const current = store.channels[key];
       if (
         !last ||
@@ -235,12 +236,17 @@ export class ChannelMuteSyncManager {
       gen !== null &&
       (gen !== this.seedGen || this.seedHead?.id !== this.head?.id);
     try {
-      const merged = await this.fetchOwnBlobBeforePublish(store);
+      const fetched = await this.fetchOwnBlobBeforePublish(store);
+      // Every send carries the canonical head's known content (per-entry
+      // LWW), even when the pre-publish read is absent or fails.
+      const merged = this.headStore
+        ? mergeStores(fetched, this.headStore)
+        : fetched;
       // Guard: manager may have been destroyed while fetchOwnBlobBeforePublish
       // was awaited (community switch during in-flight fetch). If so, abort
       // before touching the relay.
       if (this.destroyed || stale()) return;
-      if (this.isIdenticalToLastPublished(merged)) {
+      if (this.isRepresentedByHead(merged)) {
         this.settle(store, gen);
         return;
       }
@@ -269,11 +275,9 @@ export class ChannelMuteSyncManager {
         "Failed to publish channel mutes.",
       );
       this.recordRemoteHead(event);
-      this.lastPublishedStore = merged;
-      this.lastPublishedHeadId = event.id;
       this.settle(store, gen);
-      // A newer seed generation (folded while this was in flight) must also
-      // carry our own published head.
+      // Records our payload as the head's content if we won, and folds it
+      // into a newer seed generation folded while this was in flight.
       this.foldIntoSeed(headOf(event), merged);
     } catch (error) {
       console.warn("[channelMutesSync] publish failed:", error);

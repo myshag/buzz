@@ -1665,3 +1665,496 @@ for (const [getLane, name, dTag, flag, Manager, ids, edit] of [
     });
   }
 }
+
+// Canonical head content: successive edits, ACK-to-echo gap, tombstones.
+for (const [getLane, name, dTag, flag, Manager, ids, edit, remove] of [
+  [
+    () => stars,
+    "useChannelStars",
+    "channel-stars",
+    "starred",
+    "ChannelStarSyncManager",
+    "starredChannelIds",
+    "starChannel",
+    "unstarChannel",
+  ],
+  [
+    () => mutes,
+    "useChannelMutes",
+    "channel-mutes",
+    "muted",
+    "ChannelMuteSyncManager",
+    "mutedChannelIds",
+    "muteChannel",
+    "unmuteChannel",
+  ],
+]) {
+  for (const mode of [
+    "two-before-absent",
+    "two-before-throws",
+    "two-after-absent",
+    "two-after-throws",
+    "two-after-echo",
+    "reconnect",
+    "tombstone-tie",
+    "tombstone-future",
+  ]) {
+    test(`${name} carried head content: ${mode}`, async (t) => {
+      const lane = getLane(),
+        NOW = 1800000000,
+        pk = `focused-${dTag}-${mode}`;
+      t.mock.method(Date, "now", () => NOW * 1000);
+      const entries = (...keys) => ({
+        version: 1,
+        channels: Object.fromEntries(
+          keys.map((k) => [k, { [flag]: true, updatedAt: NOW }]),
+        ),
+      });
+      const payload = (e) => JSON.parse(e.content),
+        visible = (hook) => [...hook.result.current[ids]].sort();
+      const remote = entries("remote");
+      if (mode === "tombstone-older")
+        remote.channels.remote.updatedAt = NOW - 1;
+      if (mode === "tombstone-future")
+        remote.channels.remote.updatedAt = NOW + 30;
+      let head = relayEvent(pk, dTag, NOW + 30, remote, "b".repeat(64));
+      const boot = deferred(),
+        read = deferred(),
+        manager = captureManager(t, lane[Manager]);
+      const relay = setup(t, pk, (n) =>
+        n === 1 ? boot.promise : n === 2 ? read.promise : [],
+      );
+      let live,
+        signs = 0;
+      relayClient.subscribeLive = async (_, cb) => {
+        live = cb;
+        return async () => {};
+      };
+      const invoke = window.__TAURI_INTERNALS__.invoke;
+      window.__TAURI_INTERNALS__.invoke = async (cmd, args) => {
+        const result = await invoke(cmd, args);
+        if (cmd === "sign_event") {
+          const event = JSON.parse(result);
+          event.id = (++signs).toString(16).padStart(64, "0");
+          return JSON.stringify(event);
+        }
+        return result;
+      };
+      const sends = [];
+      relay.publish = async (event) => {
+        sends.push({
+          payload: payload(event),
+          at: event.created_at,
+          id: event.id,
+        });
+        if (
+          event.created_at > head.created_at ||
+          (event.created_at === head.created_at && event.id < head.id)
+        )
+          head = event;
+      };
+      window.localStorage.setItem(
+        lane.storageKey(pk),
+        JSON.stringify(entries("seed")),
+      );
+      const first = renderHook(() => lane[name](pk, RELAY));
+      await until(() => relay.fetches === 2, "mount reads");
+      await act(async () => boot.resolve([]));
+      await until(() => pendingOf(manager.current) != null, "seed");
+      await act(async () => read.resolve([head]));
+      await flush();
+      assert.deepEqual(
+        visible(first),
+        ["seed"],
+        "R must not already be in React",
+      );
+      assert.deepEqual(
+        Object.keys(pendingOf(manager.current).channels).sort(),
+        ["remote", "seed"],
+      );
+      relay.fetch = () => {
+        if (mode.endsWith("throws")) throw new Error("review read failure");
+        return mode.endsWith("readable") ? [head] : [];
+      };
+      await act(async () =>
+        first.result.current[mode.startsWith("tombstone") ? remove : edit](
+          mode.startsWith("tombstone") ? "remote" : "user",
+        ),
+      );
+      await flush();
+      const firstPending = structuredClone(pendingOf(manager.current));
+      const output = {
+        dTag,
+        mode,
+        firstPending,
+        reactAfterEdit: visible(first),
+      };
+      if (mode.startsWith("two-after")) {
+        await tick(t, 2000);
+        await flush();
+        output.firstRetained = payload(head);
+      }
+      if (mode === "two-after-echo") {
+        await act(async () => live(head));
+        await flush();
+      }
+      if (mode.startsWith("two-")) {
+        await act(async () => first.result.current[edit]("second"));
+        await flush();
+        output.secondPending = structuredClone(pendingOf(manager.current));
+      }
+      if (mode === "reconnect") {
+        await act(async () => relay.reconnect());
+        await flush();
+        output.requeued = pendingOf(manager.current) !== null;
+        output.seed = manager.current.seedStore;
+      }
+      await tick(t, 2000);
+      await flush();
+      output.beforeDelivery = {
+        ui: visible(first),
+        cache: JSON.parse(window.localStorage.getItem(lane.storageKey(pk))),
+        pending: pendingOf(manager.current),
+      };
+      output.retained = payload(head);
+      output.retainedAt = head.created_at;
+      output.sends = sends;
+      if (mode.startsWith("two-")) {
+        relay.fetch = () => [head];
+        await tick(t, 5000);
+        await flush();
+      } // later recovery read
+      output.afterDelivery = {
+        ui: visible(first),
+        cache: JSON.parse(window.localStorage.getItem(lane.storageKey(pk))),
+      };
+      first.unmount();
+      window.localStorage.clear();
+      relay.fetch = () => [head];
+      const fresh = renderHook(() => lane[name](pk, RELAY));
+      await flush();
+      output.fresh = visible(fresh);
+      const want = entries(
+        "remote",
+        "seed",
+        ...(mode.startsWith("tombstone") ? [] : ["user"]),
+        ...(mode.startsWith("two-") ? ["second"] : []),
+      );
+      if (mode.startsWith("tombstone"))
+        want.channels.remote =
+          mode === "tombstone-future"
+            ? remote.channels.remote
+            : { [flag]: false, updatedAt: NOW };
+      assert.deepEqual(
+        output.retained,
+        want,
+        "retained payload lost the carried union or conflict result",
+      );
+      assert.deepEqual(
+        output.fresh,
+        Object.keys(want.channels)
+          .filter((k) => want.channels[k][flag])
+          .sort(),
+        "fresh-device visible set",
+      );
+      assert.equal(output.beforeDelivery.pending, null);
+      assert.ok(output.retainedAt > NOW + 30, "publish must beat observed R");
+      if (mode.startsWith("two-")) {
+        assert.deepEqual(
+          output.afterDelivery.ui,
+          ["remote", "second", "seed", "user"],
+          "later recovery lost R",
+        );
+        assert.deepEqual(output.afterDelivery.cache, want);
+      }
+      if (mode === "reconnect") {
+        assert.equal(output.requeued, true);
+        assert.equal(output.seed, null);
+      }
+    });
+  }
+}
+
+// Content dedup quiesces under slow ACKs.
+for (const [getLane, dTag, flag, Manager, subscribe] of [
+  [
+    () => stars,
+    "channel-stars",
+    "starred",
+    "ChannelStarSyncManager",
+    "subscribeToStars",
+  ],
+  [
+    () => mutes,
+    "channel-mutes",
+    "muted",
+    "ChannelMuteSyncManager",
+    "subscribeToMutes",
+  ],
+]) {
+  for (const delay of [100, 3000])
+    test(`${dTag} own echo before a ${delay}ms ACK settles`, async (t) => {
+      const lane = getLane(),
+        NOW = 1800000000,
+        pk = `own-delay-${dTag}-${delay}`;
+      let elapsed = 0;
+      t.mock.method(Date, "now", () => NOW * 1000 + elapsed);
+      const store = {
+        version: 1,
+        channels: { same: { [flag]: true, updatedAt: NOW } },
+      };
+      const relay = setup(t, pk);
+      let head = null,
+        live,
+        signs = 0;
+      const sends = [];
+      relayClient.subscribeLive = async (_, cb) => {
+        live = cb;
+        return async () => {};
+      };
+      const invoke = window.__TAURI_INTERNALS__.invoke;
+      window.__TAURI_INTERNALS__.invoke = async (cmd, args) => {
+        const result = await invoke(cmd, args);
+        if (cmd !== "sign_event") return result;
+        const e = JSON.parse(result);
+        e.id = (++signs).toString(16).padStart(64, "0");
+        return JSON.stringify(e);
+      };
+      relay.publish = async (event) => {
+        sends.push({ at: event.created_at, elapsed });
+        head = event;
+        live(event);
+        await new Promise((r) => window.setTimeout(r, delay));
+      };
+      window.localStorage.setItem(lane.storageKey(pk), JSON.stringify(store));
+      const captured = captureManager(t, lane[Manager]);
+      const hook = renderHook(() =>
+        lane[dTag === "channel-stars" ? "useChannelStars" : "useChannelMutes"](
+          pk,
+          RELAY,
+        ),
+      );
+      await flush();
+      const m = captured.current;
+      relay.fetch = () => (head ? [head] : []);
+      for (let i = 0; i < 200; i++) {
+        elapsed += 100;
+        await tick(t, 100);
+        await flush(2);
+      }
+      hook.unmount();
+      // One seed publish; its echo makes headStore equal the seed, so the rearmed
+      // continuation dedups instead of publishing again.
+      assert.equal(
+        sends.length,
+        1,
+        "identical own echoes perpetuate seed publications",
+      );
+      assert.equal(m.seedStore, null);
+      assert.equal(pendingOf(m), null);
+    });
+}
+
+for (const [getLane, dTag, flag, Manager, subscribe] of [
+  [
+    () => stars,
+    "channel-stars",
+    "starred",
+    "ChannelStarSyncManager",
+    "subscribeToStars",
+  ],
+  [
+    () => mutes,
+    "channel-mutes",
+    "muted",
+    "ChannelMuteSyncManager",
+    "subscribeToMutes",
+  ],
+]) {
+  test(`${dTag} identical peer seeds with delayed completions settle`, async (t) => {
+    const lane = getLane(),
+      NOW = 1800000000,
+      pk = `peer-acks-${dTag}`;
+    let now = NOW;
+    t.mock.method(Date, "now", () => now * 1000);
+    const store = {
+      version: 1,
+      channels: { same: { [flag]: true, updatedAt: NOW } },
+    };
+    const relay = setup(t, pk);
+    let head = null,
+      signs = 0;
+    const callbacks = [],
+      jobs = [];
+    relayClient.subscribeLive = async (_, cb) => {
+      callbacks.push(cb);
+      return async () => {};
+    };
+    const invoke = window.__TAURI_INTERNALS__.invoke;
+    window.__TAURI_INTERNALS__.invoke = async (cmd, args) => {
+      const result = await invoke(cmd, args);
+      if (cmd !== "sign_event") return result;
+      const e = JSON.parse(result);
+      e.id = (++signs).toString(16).padStart(64, "0");
+      return JSON.stringify(e);
+    };
+    relay.publish = async (event) => {
+      const gate = deferred();
+      jobs.push({ event, gate });
+      if (
+        !head ||
+        event.created_at > head.created_at ||
+        (event.created_at === head.created_at && event.id < head.id)
+      )
+        head = event;
+      await gate.promise;
+    };
+    const a = new lane[Manager](pk, RELAY),
+      b = new lane[Manager](pk, RELAY);
+    t.after(() => {
+      a.destroy();
+      b.destroy();
+      for (const j of jobs) j.gate.resolve();
+    });
+    await a[subscribe](() => {});
+    await b[subscribe](() => {});
+    await a.bootstrap(store);
+    await tick(t, 1);
+    await b.bootstrap(structuredClone(store));
+    relay.fetch = () => (head ? [head] : []);
+    await tick(t, 1999);
+    await flush();
+    assert.equal(jobs.length, 1);
+    // A's accepted event reaches B while A's publish promise is still pending.
+    callbacks[1](jobs[0].event);
+    await flush();
+    let stalled = false;
+    for (let i = 1; i <= 8; i++) {
+      now += 2;
+      await tick(t, 2000);
+      await flush();
+      if (jobs.length === i) {
+        stalled = true;
+        break;
+      }
+      assert.equal(jobs.length, i + 1, "exactly one alternating continuation");
+      // B/A's accepted event reaches the other seed owner before its old completion.
+      callbacks[(i + 1) % 2](jobs[i].event);
+      await flush();
+      await act(async () => jobs[i - 1].gate.resolve());
+      await flush();
+    }
+    const output = {
+      dTag,
+      stalled,
+      publications: jobs.map((j) => ({
+        at: j.event.created_at,
+        payload: JSON.parse(j.event.content),
+      })),
+      pendingA: pendingOf(a),
+      pendingB: pendingOf(b),
+    };
+    for (const j of jobs) j.gate.resolve();
+    await flush();
+    for (let i = 0; i < 6; i++) {
+      now += 2;
+      await tick(t, 2000);
+      await flush();
+      for (const j of jobs) j.gate.resolve();
+      await flush();
+    }
+    output.afterPromptAcks = {
+      count: jobs.length,
+      pendingA: pendingOf(a),
+      pendingB: pendingOf(b),
+    };
+    assert.equal(pendingOf(a), null);
+    assert.equal(pendingOf(b), null);
+    assert.ok(
+      stalled,
+      "identical peer payloads keep generating alternating publications",
+    );
+    assert.ok(jobs.length <= 2, "identical peer content republished");
+  });
+}
+
+for (const [getLane, dTag, flag, Manager, publish, subscribe] of [
+  [
+    () => stars,
+    "channel-stars",
+    "starred",
+    "ChannelStarSyncManager",
+    "publishStars",
+    "subscribeToStars",
+  ],
+  [
+    () => mutes,
+    "channel-mutes",
+    "muted",
+    "ChannelMuteSyncManager",
+    "publishMutes",
+    "subscribeToMutes",
+  ],
+]) {
+  test(`${dTag} undecoded newer head is not represented by older head content`, async (t) => {
+    const lane = getLane();
+    const NOW = 1800000000;
+    const pk = `stale-head-store-${dTag}`;
+    t.mock.method(Date, "now", () => NOW * 1000);
+    const mine = {
+      version: 1,
+      channels: { mine: { [flag]: true, updatedAt: NOW } },
+    };
+    const relay = setup(t, pk);
+    let head = null;
+    let live;
+    relayClient.subscribeLive = async (_, cb) => {
+      live = cb;
+      return async () => {};
+    };
+    const foreign = relayEvent(
+      pk,
+      dTag,
+      NOW + 60,
+      { version: 1, channels: {} },
+      "f".repeat(64),
+    );
+    const decode = deferred();
+    const invoke = window.__TAURI_INTERNALS__.invoke;
+    window.__TAURI_INTERNALS__.invoke = async (cmd, args) => {
+      if (
+        cmd === "nip44_decrypt_from_self" &&
+        args.ciphertext === foreign.content
+      )
+        await decode.promise;
+      return invoke(cmd, args);
+    };
+    relay.publish = async (e) => {
+      if (!head || e.created_at > head.created_at) head = e;
+    };
+    relay.fetch = () => [];
+    const m = new lane[Manager](pk, RELAY);
+    t.after(() => {
+      decode.resolve();
+      m.destroy();
+    });
+    await m[subscribe](() => {});
+    m[publish](mine); // our head: headStore = mine
+    await tick(t, 2000);
+    await flush();
+    head = foreign;
+    live(foreign); // newer raw head; its decode is held
+    await flush();
+    m[publish](structuredClone(mine));
+    await tick(t, 2000);
+    await flush();
+    assert.equal(
+      relay.published.length,
+      2,
+      "stale head content suppressed the publish",
+    );
+    assert.deepEqual(Object.keys(JSON.parse(head.content).channels), ["mine"]);
+    assert.ok(head.created_at > NOW + 60);
+    assert.equal(pendingOf(m), null);
+  });
+}
