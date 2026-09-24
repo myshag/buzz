@@ -46,6 +46,8 @@ export class ChannelMuteSyncManager {
   private lastRemoteCreatedAt: number;
   private pendingStore: ChannelMuteStore | null = null;
   private lastPublishedStore: ChannelMuteStore | null = null;
+  /** The bootstrap seed, queued because the relay had no head. */
+  private seedStore: ChannelMuteStore | null = null;
   private destroyed = false;
 
   constructor(pubkey: string, relayUrl: string) {
@@ -87,6 +89,13 @@ export class ChannelMuteSyncManager {
       this.lastRemoteCreatedAt = createdAt;
     }
     advanceWatermark(this.pubkey, BLOB_TYPE, this.relayUrl, createdAt);
+    // An observed head supersedes the absence-based seed, so it stops being
+    // pending: recovery must not keep skipping reads for a seed whose timer
+    // a remote apply may already have cancelled.  Real edits are untouched.
+    if (this.pendingStore !== null && this.pendingStore === this.seedStore) {
+      this.cancelPendingMutePublish();
+      this.pendingStore = null;
+    }
   }
 
   cancelPendingMutePublish(): void {
@@ -158,7 +167,12 @@ export class ChannelMuteSyncManager {
       // was awaited (community switch during in-flight fetch). If so, abort
       // before touching the relay.
       if (this.destroyed) return;
-      if (this.isIdenticalToLastPublished(merged)) {
+      // The seed was queued only because the relay had no head (watermark
+      // 0).  Any head recorded since — recovery, live, or the read above —
+      // wins, so the seed is abandoned rather than published over it.
+      const seedSuperseded =
+        store === this.seedStore && this.lastRemoteCreatedAt > 0;
+      if (seedSuperseded || this.isIdenticalToLastPublished(merged)) {
         if (this.pendingStore === store) this.pendingStore = null;
         return;
       }
@@ -181,6 +195,12 @@ export class ChannelMuteSyncManager {
         ],
       });
       if (this.destroyed) return;
+      // Re-check after the async encrypt/sign: a head recorded meanwhile
+      // still supersedes the seed.
+      if (store === this.seedStore && this.lastRemoteCreatedAt > 0) {
+        if (this.pendingStore === store) this.pendingStore = null;
+        return;
+      }
       await relayClient.publishEvent(
         event,
         "Timed out publishing channel mutes.",
@@ -229,7 +249,10 @@ export class ChannelMuteSyncManager {
       lastHead: this.lastRemoteCreatedAt,
       localStore,
       isLocalNonEmpty: (s) => Object.keys(s.channels).length > 0,
-      publishFn: (s) => this.publishMutes(s),
+      publishFn: (s) => {
+        this.seedStore = s;
+        this.publishMutes(s);
+      },
     });
   }
 

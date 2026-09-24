@@ -46,6 +46,8 @@ export class ChannelStarSyncManager {
   private lastRemoteCreatedAt: number;
   private pendingStore: ChannelStarStore | null = null;
   private lastPublishedStore: ChannelStarStore | null = null;
+  /** The bootstrap seed, queued because the relay had no head. */
+  private seedStore: ChannelStarStore | null = null;
   private destroyed = false;
 
   constructor(pubkey: string, relayUrl: string) {
@@ -87,6 +89,13 @@ export class ChannelStarSyncManager {
       this.lastRemoteCreatedAt = createdAt;
     }
     advanceWatermark(this.pubkey, BLOB_TYPE, this.relayUrl, createdAt);
+    // An observed head supersedes the absence-based seed, so it stops being
+    // pending: recovery must not keep skipping reads for a seed whose timer
+    // a remote apply may already have cancelled.  Real edits are untouched.
+    if (this.pendingStore !== null && this.pendingStore === this.seedStore) {
+      this.cancelPendingStarPublish();
+      this.pendingStore = null;
+    }
   }
 
   cancelPendingStarPublish(): void {
@@ -158,7 +167,12 @@ export class ChannelStarSyncManager {
       // was awaited (community switch during in-flight fetch). If so, abort
       // before touching the relay.
       if (this.destroyed) return;
-      if (this.isIdenticalToLastPublished(merged)) {
+      // The seed was queued only because the relay had no head (watermark
+      // 0).  Any head recorded since — recovery, live, or the read above —
+      // wins, so the seed is abandoned rather than published over it.
+      const seedSuperseded =
+        store === this.seedStore && this.lastRemoteCreatedAt > 0;
+      if (seedSuperseded || this.isIdenticalToLastPublished(merged)) {
         if (this.pendingStore === store) this.pendingStore = null;
         return;
       }
@@ -181,6 +195,12 @@ export class ChannelStarSyncManager {
         ],
       });
       if (this.destroyed) return;
+      // Re-check after the async encrypt/sign: a head recorded meanwhile
+      // still supersedes the seed.
+      if (store === this.seedStore && this.lastRemoteCreatedAt > 0) {
+        if (this.pendingStore === store) this.pendingStore = null;
+        return;
+      }
       await relayClient.publishEvent(
         event,
         "Timed out publishing channel stars.",
@@ -229,7 +249,10 @@ export class ChannelStarSyncManager {
       lastHead: this.lastRemoteCreatedAt,
       localStore,
       isLocalNonEmpty: (s) => Object.keys(s.channels).length > 0,
-      publishFn: (s) => this.publishStars(s),
+      publishFn: (s) => {
+        this.seedStore = s;
+        this.publishStars(s);
+      },
     });
   }
 
