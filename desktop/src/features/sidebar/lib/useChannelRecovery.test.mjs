@@ -609,7 +609,8 @@ for (const lane of [
     ui: (r) => sectionNames(r.current).join(),
     cache: (pk) =>
       sectionNames(sections.readChannelSectionsStore(pk, RELAY)).join(),
-    kept: "Seed",
+    // Whole-blob lane: the head recovery observed supersedes the seed.
+    yielded: "Remote",
   },
   {
     name: "useChannelStars",
@@ -636,7 +637,7 @@ for (const lane of [
     merged: "remote,seed",
   },
 ]) {
-  test(`${lane.name} recovery read does not cancel a pending bootstrap seed`, async (t) => {
+  test(`${lane.name} bootstrap seed against a head recovery observed`, async (t) => {
     const pk = `pk-seed-${lane.dTag}`;
     const boot = deferred();
     const recovery = deferred();
@@ -663,7 +664,19 @@ for (const lane of [
     );
     await flush();
 
-    await tick(t, 2_000); // seed debounce
+    await tick(t, 2_000); // seed debounce; prepublish read returns []
+    if (lane.yielded) {
+      await until(() => pending() === null, "seed still pending");
+      assert.equal(relay.published.length, 0, "seed overwrote the head");
+      relay.fetch = () => [relayEvent(pk, lane.dTag, 3000, lane.remote)];
+      await tick(t, 5_000);
+      await until(
+        () =>
+          lane.ui(result) === lane.yielded && lane.cache(pk) === lane.yielded,
+        "observed head not adopted after the seed yielded",
+      );
+      return;
+    }
     await until(
       () => relay.published.length === 1 && pending() === null,
       "recovery read cancelled the seed publication",
@@ -680,6 +693,98 @@ for (const lane of [
       () => lane.ui(result) === lane.merged && lane.cache(pk) === lane.merged,
       "remote entry not merged after the seed published",
     );
+  });
+}
+
+// ---------------------------------------------------------------------------
+// Whole-blob lanes: an absence-based seed must not replace a remote head that
+// a later read observed.  The prepublish read finds R, so the seed is
+// abandoned and the next recovery tick adopts R.
+// ---------------------------------------------------------------------------
+for (const lane of [
+  {
+    name: "useChannelSections",
+    dTag: "channel-sections",
+    Manager: () => sections.ChannelSectionSyncManager,
+    render: (pk) => sections.useChannelSections(pk, RELAY),
+    seed: sectionsPayload("Seed"),
+    remote: sectionsPayload("Remote"),
+    key: (pk) => sections.storageKey(pk, RELAY),
+    ui: (r) => sectionNames(r.current).join(),
+    cache: (pk) =>
+      sectionNames(sections.readChannelSectionsStore(pk, RELAY)).join(),
+    adopted: "Remote",
+  },
+  {
+    name: "useChannelSortPreference",
+    dTag: "channel-sort",
+    Manager: () => sort.ChannelSortSyncManager,
+    render: (pk) => sort.useChannelSortPreference(pk, RELAY),
+    seed: { version: 1, groups: { channels: "recent" } },
+    remote: { version: 1, groups: { dms: "recent" } },
+    key: (pk) => sort.storageKey(pk, RELAY),
+    ui: (r) =>
+      ["channels", "dms"]
+        .filter((g) => r.current.sortModeFor(g) !== "alpha")
+        .join(),
+    cache: (pk) =>
+      Object.keys(sort.readChannelSortStore(pk, RELAY).groups).join(),
+    adopted: "dms",
+  },
+]) {
+  test(`${lane.name} bootstrap seed yields to a head observed after it was queued`, async (t) => {
+    const pk = `pk-seed-yield-${lane.dTag}`;
+    const boot = deferred();
+    const recovery = deferred();
+    const manager = captureManager(t, lane.Manager());
+    const remote = [relayEvent(pk, lane.dTag, 3000, lane.remote)];
+    const relay = setup(t, pk, (n) =>
+      n === 1 ? boot.promise : n === 2 ? recovery.promise : remote,
+    );
+    window.localStorage.setItem(lane.key(pk), JSON.stringify(lane.seed));
+    const { result } = renderHook(() => lane.render(pk));
+    await until(() => relay.fetches === 2, "mount reads not in flight");
+
+    await act(async () => boot.resolve([]));
+    await until(
+      () => manager.current.getPendingStore() !== null,
+      "bootstrap did not seed",
+    );
+    await act(async () => recovery.resolve(remote));
+    await flush();
+
+    await tick(t, 2_000); // seed debounce → prepublish read returns R
+    await until(
+      () => relay.fetches === 3 && manager.current.getPendingStore() === null,
+      "seed was not abandoned",
+    );
+    assert.equal(relay.published.length, 0, "seed overwrote the remote head");
+
+    relay.reconnect(); // a cancelled seed must not come back via reconnect
+    await flush();
+    await tick(t, 5_000); // next recovery tick adopts R
+    await until(
+      () => lane.ui(result) === lane.adopted && lane.cache(pk) === lane.adopted,
+      "remote head not adopted after the seed yielded",
+    );
+    await tick(t, 2_000);
+    await flush();
+    assert.equal(relay.published.length, 0, "seed republished");
+  });
+
+  test(`${lane.name} bootstrap seed publishes when no head appears`, async (t) => {
+    const pk = `pk-seed-control-${lane.dTag}`;
+    const manager = captureManager(t, lane.Manager());
+    const relay = setup(t, pk, () => []);
+    window.localStorage.setItem(lane.key(pk), JSON.stringify(lane.seed));
+    renderHook(() => lane.render(pk));
+    await until(
+      () => manager.current?.getPendingStore() != null,
+      "bootstrap did not seed",
+    );
+    await tick(t, 2_000);
+    await until(() => relay.published.length === 1, "seed was not published");
+    assert.deepEqual(relay.payload(), lane.seed);
   });
 }
 

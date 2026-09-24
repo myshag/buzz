@@ -48,6 +48,8 @@ export class ChannelSectionSyncManager {
   private lastRemoteCreatedAt: number;
   private pendingStore: ChannelSectionStore | null = null;
   private lastPublishedStore: ChannelSectionStore | null = null;
+  /** The bootstrap seed, queued because the relay had no head. */
+  private seedStore: ChannelSectionStore | null = null;
   private destroyed = false;
 
   constructor(pubkey: string, relayUrl: string) {
@@ -183,7 +185,12 @@ export class ChannelSectionSyncManager {
       // was awaited (community switch during in-flight fetch). If so, abort
       // before touching the relay.
       if (this.destroyed) return;
-      if (this.isIdenticalToLastPublished(merged)) {
+      // The seed was queued only because the relay had no head (watermark
+      // 0).  Any head recorded since — recovery, live, or the read above —
+      // wins, so the seed is abandoned rather than published over it.
+      const seedSuperseded =
+        store === this.seedStore && this.lastRemoteCreatedAt > 0;
+      if (seedSuperseded || this.isIdenticalToLastPublished(merged)) {
         if (this.pendingStore === store) this.pendingStore = null;
         return;
       }
@@ -258,7 +265,10 @@ export class ChannelSectionSyncManager {
       lastHead: this.lastRemoteCreatedAt,
       localStore,
       isLocalNonEmpty: (s) => s.sections.length > 0,
-      publishFn: (s) => this.publishSections(s),
+      publishFn: (s) => {
+        this.seedStore = s;
+        this.publishSections(s);
+      },
     });
   }
 
