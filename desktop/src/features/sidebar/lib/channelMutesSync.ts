@@ -39,6 +39,20 @@ async function decryptAndParse(event: RelayEvent): Promise<RemoteMutes | null> {
   }
 }
 
+/** A relay head's identity, ordered as the relay picks its winner. */
+type HeadId = { createdAt: number; id: string };
+
+const headOf = (event: RelayEvent): HeadId => ({
+  createdAt: event.created_at,
+  id: event.id,
+});
+
+/** `a` beats `b`: later `created_at`, then lower ID (replaceable.rs). */
+const beats = (a: HeadId, b: HeadId | null): boolean =>
+  b === null ||
+  a.createdAt > b.createdAt ||
+  (a.createdAt === b.createdAt && a.id < b.id);
+
 export class ChannelMuteSyncManager {
   private pubkey: string;
   private relayUrl: string;
@@ -46,13 +60,18 @@ export class ChannelMuteSyncManager {
   private lastRemoteCreatedAt: number;
   private pendingStore: ChannelMuteStore | null = null;
   private lastPublishedStore: ChannelMuteStore | null = null;
+  /** The canonical relay head observed so far. */
+  private head: HeadId | null = null;
   /**
    * The bootstrap seed, queued because the relay had no head, unioned with
-   * every head decoded since.  It may publish only while it holds the
-   * highest head observed (`seedHeadAt === lastRemoteCreatedAt`).
+   * every canonical head decoded since (`seedHead`).  Non-null exactly while
+   * the seed is the pending work.  `seedGen` advances on every seed change;
+   * a seed job publishes only while its generation is current and its
+   * folded head is the canonical head.
    */
   private seedStore: ChannelMuteStore | null = null;
-  private seedHeadAt = 0;
+  private seedHead: HeadId | null = null;
+  private seedGen = 0;
   private destroyed = false;
 
   constructor(pubkey: string, relayUrl: string) {
@@ -73,9 +92,9 @@ export class ChannelMuteSyncManager {
         return { status: "absent" };
       }
       const event = events[0];
-      this.recordRemoteHead(event.created_at);
+      this.recordRemoteHead(event);
       const result = await decryptAndParse(event);
-      this.foldIntoSeed(event.created_at, result, true);
+      this.foldIntoSeed(headOf(event), result?.store ?? null);
       if (!result) {
         return { status: "failed", createdAt: event.created_at };
       }
@@ -90,43 +109,37 @@ export class ChannelMuteSyncManager {
     }
   }
 
-  private recordRemoteHead(createdAt: number): void {
-    if (createdAt > this.lastRemoteCreatedAt) {
-      this.lastRemoteCreatedAt = createdAt;
+  private recordRemoteHead(event: RelayEvent): void {
+    if (event.created_at > this.lastRemoteCreatedAt) {
+      this.lastRemoteCreatedAt = event.created_at;
     }
-    advanceWatermark(this.pubkey, BLOB_TYPE, this.relayUrl, createdAt);
+    advanceWatermark(this.pubkey, BLOB_TYPE, this.relayUrl, event.created_at);
+    if (beats(headOf(event), this.head)) this.head = headOf(event);
   }
 
   /**
-   * Folds a decoded head into a pending seed so the seed never publishes
-   * without it.  A head that cannot be decoded cannot be folded, so the seed
-   * is abandoned rather than published over it.  `rearm` restarts the seed
-   * debounce for heads observed outside a publish.
+   * Folds the canonical head into a pending seed, as a new generation that
+   * re-arms the seed job, so the seed never publishes without it.  A head
+   * that cannot be decoded cannot be folded, so the seed is abandoned rather
+   * than published over it; its entries stay in the local cache only.
    */
-  private foldIntoSeed(
-    createdAt: number,
-    remote: RemoteMutes | null,
-    rearm: boolean,
-  ): void {
-    const seed = this.seedStore;
-    if (seed === null || this.pendingStore !== seed) return;
-    if (createdAt <= this.seedHeadAt || createdAt < this.lastRemoteCreatedAt)
-      return;
-    if (!remote) {
+  private foldIntoSeed(head: HeadId, remote: ChannelMuteStore | null): void {
+    if (this.seedStore === null || this.head?.id !== head.id) return;
+    if (this.seedHead?.id === head.id) return;
+    this.seedGen++;
+    if (remote === null) {
       this.clearTimer();
       this.pendingStore = this.seedStore = null;
       return;
     }
-    this.seedStore = this.pendingStore = mergeStores(seed, remote.store);
-    this.seedHeadAt = createdAt;
-    if (rearm) this.publishMutes(this.seedStore);
+    this.seedHead = head;
+    this.seedStore = mergeStores(this.seedStore, remote);
+    this.arm(this.seedStore, this.seedGen);
   }
 
   /** Remote applies supersede real edits; a seed already holds the head. */
   cancelPendingMutePublish(): void {
-    if (this.pendingStore !== null && this.pendingStore === this.seedStore)
-      return;
-    this.clearTimer();
+    if (this.seedStore === null) this.clearTimer();
   }
 
   private clearTimer(): void {
@@ -141,13 +154,25 @@ export class ChannelMuteSyncManager {
   }
 
   publishMutes(store: ChannelMuteStore): void {
-    this.pendingStore = store;
-    if (this.debounceTimer !== null) {
-      window.clearTimeout(this.debounceTimer);
+    if (store === this.seedStore) {
+      this.arm(store, this.seedGen); // reconnect requeue keeps provenance
+      return;
     }
+    // A real edit supersedes the seed: any seed job becomes obsolete.
+    if (this.seedStore !== null) {
+      this.seedStore = null;
+      this.seedGen++;
+    }
+    this.arm(store, null);
+  }
+
+  /** `gen` is the seed generation a seed job was armed with; null for edits. */
+  private arm(store: ChannelMuteStore, gen: number | null): void {
+    this.pendingStore = store;
+    this.clearTimer();
     this.debounceTimer = window.setTimeout(() => {
       this.debounceTimer = null;
-      void this.doPublish(store);
+      void this.doPublish(store, gen);
     }, DEBOUNCE_MS);
   }
 
@@ -164,9 +189,9 @@ export class ChannelMuteSyncManager {
       if (events.length === 0 || events[0].pubkey !== this.pubkey) return store;
       const event = events[0];
       // Record the raw head before decrypt on the pre-publish path too.
-      this.recordRemoteHead(event.created_at);
+      this.recordRemoteHead(event);
       const remote = await decryptAndParse(event);
-      this.foldIntoSeed(event.created_at, remote, false);
+      this.foldIntoSeed(headOf(event), remote?.store ?? null);
       if (!remote) return store;
       return mergeStores(store, remote.store);
     } catch {
@@ -192,24 +217,24 @@ export class ChannelMuteSyncManager {
     return true;
   }
 
-  private async doPublish(store: ChannelMuteStore): Promise<void> {
-    const seed = store === this.seedStore;
+  private async doPublish(
+    store: ChannelMuteStore,
+    gen: number | null,
+  ): Promise<void> {
+    // A seed job whose generation was superseded, or whose folded head is no
+    // longer canonical, exits silently: the fold that superseded it owns the
+    // re-armed seed and its pending state.
+    const stale = () =>
+      gen !== null &&
+      (gen !== this.seedGen || this.seedHead?.id !== this.head?.id);
     try {
-      let merged = await this.fetchOwnBlobBeforePublish(store);
+      const merged = await this.fetchOwnBlobBeforePublish(store);
       // Guard: manager may have been destroyed while fetchOwnBlobBeforePublish
       // was awaited (community switch during in-flight fetch). If so, abort
       // before touching the relay.
-      if (this.destroyed) return;
-      // A seed publishes only as its union with every observed head; an
-      // abandoned or not-yet-folded seed does not publish.
-      if (seed) {
-        if (!this.seedStore || this.seedHeadAt < this.lastRemoteCreatedAt)
-          return;
-        merged = mergeStores(merged, this.seedStore);
-      }
-      const owned = seed ? this.seedStore : store;
+      if (this.destroyed || stale()) return;
       if (this.isIdenticalToLastPublished(merged)) {
-        if (this.pendingStore === owned) this.pendingStore = null;
+        this.settle(store, gen);
         return;
       }
       const payload = {
@@ -230,26 +255,27 @@ export class ChannelMuteSyncManager {
           ["t", D_TAG], // relay discoverability; not used in our filters
         ],
       });
-      if (this.destroyed) return;
-      // Re-check after the async encrypt/sign: a head recorded meanwhile
-      // makes this union stale; its fold re-arms the seed.
-      if (
-        seed &&
-        (this.seedStore !== owned || this.seedHeadAt < this.lastRemoteCreatedAt)
-      )
-        return;
+      if (this.destroyed || stale()) return;
       await relayClient.publishEvent(
         event,
         "Timed out publishing channel mutes.",
         "Failed to publish channel mutes.",
       );
-      if (seed) this.seedStore = null;
-      this.recordRemoteHead(event.created_at);
+      this.recordRemoteHead(event);
       this.lastPublishedStore = merged;
-      if (this.pendingStore === owned) this.pendingStore = null;
+      this.settle(store, gen);
+      // A newer seed generation (folded while this was in flight) must also
+      // carry our own published head.
+      this.foldIntoSeed(headOf(event), merged);
     } catch (error) {
       console.warn("[channelMutesSync] publish failed:", error);
     }
+  }
+
+  /** Retires only the pending work (and seed generation) this job owned. */
+  private settle(store: ChannelMuteStore, gen: number | null): void {
+    if (gen !== null && gen === this.seedGen) this.seedStore = null;
+    if (this.pendingStore === store) this.pendingStore = null;
   }
 
   async subscribeToMutes(
@@ -266,10 +292,10 @@ export class ChannelMuteSyncManager {
         if (event.pubkey !== this.pubkey) return;
         // Record the raw head before decrypt so an undecryptable live event
         // still advances the watermark and blocks future seed-publish.
-        this.recordRemoteHead(event.created_at);
+        this.recordRemoteHead(event);
         void decryptAndParse(event).then((result) => {
           if (this.destroyed) return;
-          this.foldIntoSeed(event.created_at, result, true);
+          this.foldIntoSeed(headOf(event), result?.store ?? null);
           if (result) {
             onUpdate(result);
           }
@@ -291,8 +317,9 @@ export class ChannelMuteSyncManager {
       isLocalNonEmpty: (s) => Object.keys(s.channels).length > 0,
       publishFn: (s) => {
         this.seedStore = s;
-        this.seedHeadAt = 0;
-        this.publishMutes(s);
+        this.seedHead = null;
+        this.seedGen++;
+        this.arm(s, this.seedGen);
       },
     });
   }
@@ -306,6 +333,6 @@ export class ChannelMuteSyncManager {
     // per-entry via mergeStores, so no local work is permanently lost.
     this.destroyed = true;
     this.clearTimer();
-    this.pendingStore = null;
+    this.pendingStore = this.seedStore = null;
   }
 }

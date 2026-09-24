@@ -1257,3 +1257,219 @@ for (const [lane, name, dTag, flag, ids] of [
     assert.equal(relay.fetches, fetchesOnB + 1, "one B recovery read at 5 s");
   });
 }
+
+// ---------------------------------------------------------------------------
+// Per-entry seed jobs across overlapping heads and publications.  Heads are
+// ordered as the relay orders them (created_at, then lower ID); a seed job
+// publishes only for the current seed generation and canonical head, and
+// completion retires only the generation it sent.
+// ---------------------------------------------------------------------------
+for (const [getLane, name, dTag, flag, Manager, ids, edit] of [
+  [
+    () => stars,
+    "useChannelStars",
+    "channel-stars",
+    "starred",
+    "ChannelStarSyncManager",
+    "starredChannelIds",
+    "starChannel",
+  ],
+  [
+    () => mutes,
+    "useChannelMutes",
+    "channel-mutes",
+    "muted",
+    "ChannelMuteSyncManager",
+    "mutedChannelIds",
+    "muteChannel",
+  ],
+]) {
+  const NOW = 1_800_000_000;
+  const entries = (...keys) => ({
+    version: 1,
+    channels: Object.fromEntries(
+      keys.map((k) => [k, { [flag]: true, updatedAt: NOW }]),
+    ),
+  });
+  const keysOf = (event) =>
+    event.content === "not json"
+      ? "UNDECODABLE"
+      : Object.keys(JSON.parse(event.content).channels).sort().join();
+
+  /** Mounts a seed against R and hands `drive` the relay controls. */
+  async function run(t, pk, drive) {
+    const lane = getLane();
+    t.mock.method(Date, "now", () => NOW * 1000);
+    const ctl = {
+      head: relayEvent(pk, dTag, NOW + 30, entries("remote"), "bbbb"),
+      gate: deferred(),
+      pre: null,
+      holdFirstAck: false,
+      inPreflight: false,
+    };
+    const boot = deferred();
+    const recovery = deferred();
+    const manager = captureManager(t, lane[Manager]);
+    const preflight = lane[Manager].prototype.fetchOwnBlobBeforePublish;
+    let preflights = 0;
+    t.mock.method(
+      lane[Manager].prototype,
+      "fetchOwnBlobBeforePublish",
+      async function (...args) {
+        if (++preflights === 1 && ctl.pre) await ctl.pre.promise;
+        ctl.inPreflight = true;
+        try {
+          return await preflight.apply(this, args);
+        } finally {
+          ctl.inPreflight = false;
+        }
+      },
+    );
+    const relay = setup(t, pk, (n) =>
+      n === 1 ? boot.promise : n === 2 ? recovery.promise : [],
+    );
+    relayClient.subscribeLive = async (_, cb) => {
+      ctl.live = (event) => act(async () => cb(event));
+      return async () => {};
+    };
+    relay.publish = async (event) => {
+      const h = ctl.head;
+      if (
+        event.created_at > h.created_at ||
+        (event.created_at === h.created_at && event.id < h.id)
+      )
+        ctl.head = event;
+      if (ctl.holdFirstAck && relay.published.length === 0)
+        await ctl.gate.promise;
+    };
+    window.localStorage.setItem(
+      lane.storageKey(pk),
+      JSON.stringify(entries("seed")),
+    );
+    const first = renderHook(() => lane[name](pk, RELAY));
+    await until(() => relay.fetches === 2, "mount reads not in flight");
+    await act(async () => boot.resolve([]));
+    await until(() => pendingOf(manager.current) != null, "no seed");
+    await drive({ ctl, relay, recovery, first });
+    relay.fetch = () => (ctl.inPreflight ? [] : [ctl.head]);
+    for (const ms of [2_000, 5_000, 10_000]) {
+      await tick(t, ms);
+      await flush();
+    }
+    const pending = pendingOf(manager.current);
+    first.unmount();
+    window.localStorage.clear(); // a fresh device: same identity, no cache
+    const second = renderHook(() => lane[name](pk, RELAY));
+    await flush();
+    return {
+      head: keysOf(ctl.head),
+      fresh: [...second.result.current[ids]].sort().join(),
+      pending,
+    };
+  }
+
+  const recoverR = async ({ ctl, recovery }) => {
+    await act(async () => recovery.resolve([ctl.head]));
+    await flush();
+  };
+  const next = (pk, at, id, ...keys) =>
+    relayEvent(pk, dTag, NOW + at, entries(...keys), id);
+
+  for (const boundary of ["encrypt", "sign"]) {
+    test(`${name} seed folds a same-second lower-ID head during ${boundary}`, async (t) => {
+      const pk = `pk-tie-${boundary}-${dTag}`;
+      const out = await run(t, pk, async (c) => {
+        holdAt(c.relay, boundary, c.ctl.gate.promise);
+        await recoverR(c);
+        await tick(t, 2_000);
+        await flush();
+        c.ctl.head = next(pk, 30, "aaaa", "remote", "tie");
+        await c.ctl.live(c.ctl.head);
+        await flush();
+        await act(async () => c.ctl.gate.resolve());
+        await flush();
+      });
+      assert.equal(out.head, "remote,seed,tie", "winning tie head lost");
+      assert.equal(out.fresh, "remote,seed,tie");
+    });
+  }
+
+  test(`${name} same-second undecodable head abandons the seed`, async (t) => {
+    const pk = `pk-tie-undecodable-${dTag}`;
+    const out = await run(t, pk, async (c) => {
+      holdAt(c.relay, "sign", c.ctl.gate.promise);
+      await recoverR(c);
+      await tick(t, 2_000);
+      await flush();
+      c.ctl.head = next(pk, 30, "aaaa", "remote", "tie");
+      c.ctl.head.content = "not json";
+      await c.ctl.live(c.ctl.head);
+      await flush();
+      await act(async () => c.ctl.gate.resolve());
+      await flush();
+    });
+    assert.equal(out.head, "UNDECODABLE", "seed published over unknown head");
+    assert.equal(out.pending, null, "abandoned seed still pending");
+  });
+
+  test(`${name} seed timer queued before a preflight fold is obsolete`, async (t) => {
+    const pk = `pk-gen-timer-${dTag}`;
+    const out = await run(t, pk, async (c) => {
+      c.ctl.pre = deferred();
+      await recoverR(c);
+      await tick(t, 2_000); // P1 held in preflight
+      await flush();
+      c.ctl.head = next(pk, 60, "bbbb2", "remote", "second");
+      await c.ctl.live(c.ctl.head); // arms a timer for the B generation
+      await flush();
+      const C = next(pk, 90, "bbbb3", "remote", "second", "third");
+      c.ctl.head = C;
+      c.relay.fetch = () => [C];
+      await act(async () => c.ctl.pre.resolve()); // P1's preflight folds C
+      await flush();
+    });
+    assert.equal(out.head, "remote,second,seed,third", "older union won");
+    assert.equal(out.fresh, "remote,second,seed,third");
+    assert.equal(out.pending, null, "seed stranded");
+  });
+
+  test(`${name} older seed completion leaves a newer seed pending`, async (t) => {
+    const pk = `pk-gen-ack-${dTag}`;
+    const out = await run(t, pk, async (c) => {
+      c.ctl.holdFirstAck = true;
+      await recoverR(c);
+      await tick(t, 2_000); // P1 submitted, its completion held
+      await flush();
+      c.ctl.head = next(pk, 60, "bbbb2", "remote", "second");
+      await c.ctl.live(c.ctl.head);
+      await flush();
+      await act(async () => c.ctl.gate.resolve());
+      await flush();
+      c.ctl.head = next(pk, 90, "bbbb3", "remote", "second", "third");
+      await c.ctl.live(c.ctl.head); // applyRemote → cancelPending*Publish
+      await flush();
+    });
+    assert.equal(out.head, "remote,second,seed,third", "newer seed lost");
+    assert.equal(out.fresh, "remote,second,seed,third");
+    assert.equal(out.pending, null, "newer seed stranded");
+  });
+
+  test(`${name} real edit during an in-flight seed job still publishes`, async (t) => {
+    const pk = `pk-gen-edit-${dTag}`;
+    const out = await run(t, pk, async (c) => {
+      c.ctl.pre = deferred();
+      await recoverR(c);
+      await tick(t, 2_000); // seed job held in preflight
+      await flush();
+      await act(async () => c.first.result.current[edit]("user"));
+      c.relay.fetch = () => [c.ctl.head];
+      await act(async () => c.ctl.pre.resolve());
+      await flush();
+      await tick(t, 2_000); // the edit's own debounce; its preflight sees R
+      await flush();
+    });
+    assert.equal(out.head, "remote,seed,user", "real edit not published");
+    assert.equal(out.fresh, "remote,seed,user");
+    assert.equal(out.pending, null);
+  });
+}
