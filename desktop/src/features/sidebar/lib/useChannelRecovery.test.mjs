@@ -146,6 +146,16 @@ function setup(t, pubkey, fetch = () => []) {
 const pendingOf = (m) =>
   (m.getPendingStore ?? m.getPendingStarStore ?? m.getPendingMuteStore).call(m);
 
+/**
+ * Seed publications once a head is observed: none for whole-blob lanes,
+ * only the seed ∪ head union for per-entry lanes.
+ */
+function assertSeedYielded(lane, relay) {
+  const sent = lane.published?.(relay) ?? relay.published.map(() => "?");
+  const want = lane.published ? sent.map(() => lane.adopted) : [];
+  assert.deepEqual(sent, want, "seed published without the observed head");
+}
+
 /** Holds every publish at `boundary` ("encrypt" or "sign") until `gate`. */
 function holdAt(relay, boundary, gate) {
   if (boundary === "encrypt") {
@@ -610,9 +620,9 @@ test("remote response queued behind a held local updater does not replace the ed
 });
 
 // ---------------------------------------------------------------------------
-// Bootstrap seed: seeding a cached store sets pending without a local edit
-// (no revision bump), so only the apply-time pending check stops a recovery
-// read that started before the seed from cancelling the seed publication.
+// Bootstrap seed (whole-blob lane): a recovery read that started before the
+// seed and returns a head is recorded first, so the seed yields to it and a
+// later read adopts the head.
 // ---------------------------------------------------------------------------
 for (const lane of [
   {
@@ -668,8 +678,8 @@ for (const lane of [
 
 // ---------------------------------------------------------------------------
 // All four lanes: an absence-based seed must not replace a remote head that
-// a later read observed.  The seed is abandoned and recovery adopts R
-// (whole-blob lanes replace, per-entry lanes merge it into the cache).
+// a later read observed.  Whole-blob lanes abandon the seed and adopt R;
+// per-entry lanes publish only the seed's union with R.
 // ---------------------------------------------------------------------------
 for (const lane of [
   {
@@ -747,6 +757,11 @@ for (const lane of [
           .join(),
       // Per-entry lanes merge the observed head into the local seed.
       adopted: "remote,seed",
+      // Every seed publication carries R; none is the seed alone.
+      published: (relay) =>
+        relay.published.map((e) =>
+          Object.keys(JSON.parse(e.content).channels).sort().join(),
+        ),
       later: entries("remote", "later"),
       laterUi: "later,remote,seed",
     };
@@ -778,7 +793,7 @@ for (const lane of [
       () => pendingOf(manager.current) === null,
       "seed was not abandoned",
     );
-    assert.equal(relay.published.length, 0, "seed overwrote the remote head");
+    assertSeedYielded(lane, relay);
 
     relay.reconnect(); // a cancelled seed must not come back via reconnect
     await flush();
@@ -789,7 +804,7 @@ for (const lane of [
     );
     await tick(t, 2_000);
     await flush();
-    assert.equal(relay.published.length, 0, "seed republished");
+    assertSeedYielded(lane, relay);
   });
 
   for (const boundary of ["encrypt", "sign"]) {
@@ -819,15 +834,19 @@ for (const lane of [
       await flush();
       await act(async () => gate.resolve());
       await flush();
-      assert.equal(relay.published.length, 0, "seed overwrote the head");
-      assert.equal(pendingOf(manager.current), null, "seed pending");
+      if (!lane.published) {
+        assert.equal(relay.published.length, 0, "seed overwrote the head");
+        assert.equal(pendingOf(manager.current), null, "seed pending");
+      }
       relay.fetch = () => remote;
-      await tick(t, 5_000);
+      // Per-entry lanes first publish the re-armed union, then read R.
+      for (const ms of [5_000, 10_000]) await tick(t, ms);
       await until(
         () =>
           lane.ui(result) === lane.adopted && lane.cache(pk) === lane.adopted,
         "remote head not adopted",
       );
+      assertSeedYielded(lane, relay);
     });
   }
 
@@ -860,7 +879,8 @@ for (const lane of [
     await flush();
     await act(async () => gate.resolve());
     await flush();
-    assert.equal(relay.published.length, 0, "requeued seed overwrote the head");
+    if (!lane.published)
+      assert.equal(relay.published.length, 0, "requeued seed overwrote head");
     await tick(t, 10_000);
     await until(
       () => lane.ui(result) === lane.adopted && lane.cache(pk) === lane.adopted,
@@ -884,7 +904,7 @@ for (const lane of [
     await tick(t, 2_000);
     await flush();
     assert.equal(lane.ui(result), lane.adopted, "first head not applied");
-    assert.equal(relay.published.length, 0, "seed published over the head");
+    assertSeedYielded(lane, relay);
     relay.fetch = () => [relayEvent(pk, lane.dTag, 4000, lane.later)];
     for (const ms of [5_000, 10_000, 30_000, 60_000]) await tick(t, ms);
     await until(
@@ -910,10 +930,11 @@ for (const lane of [
 }
 
 // ---------------------------------------------------------------------------
-// Per-entry lanes against a replacement-aware relay: whatever publication
-// leaves as the head is what later reads return.  Recovery observes R while
-// the seed is pending; whatever prepublish then sees, R must survive on the
-// relay and the local state must hold both entries.
+// Per-entry lanes against a replacement-aware relay: the head follows
+// created_at, then lower ID (replaceable.rs), and later reads return only
+// that head.  R sits 30 s ahead of a fixed clock.  A seed must never publish
+// without the highest observed head, and once it has seen R the relay and a
+// fresh device must both end with R ∪ S.
 // ---------------------------------------------------------------------------
 for (const [getLane, name, dTag, flag, Manager, ids] of [
   [
@@ -933,62 +954,136 @@ for (const [getLane, name, dTag, flag, Manager, ids] of [
     "mutedChannelIds",
   ],
 ]) {
-  for (const prepublish of ["absent", "throws", "returns R"]) {
-    test(`${name} seed keeps an observed head when prepublish ${prepublish}`, async (t) => {
-      const lane = getLane();
-      const pk = `pk-entry-${prepublish}-${dTag}`;
-      const boot = deferred();
-      const recovery = deferred();
-      const manager = captureManager(t, lane[Manager]);
-      const entry = (k) => ({
-        version: 1,
-        channels: { [k]: { [flag]: true, updatedAt: 1000 } },
-      });
-      const R = relayEvent(pk, dTag, 3000, entry("remote"));
-      let head = R;
-      const relay = setup(t, pk, (n) => {
-        if (n === 1) return boot.promise;
-        if (n === 2) return recovery.promise;
-        if (n === 3 && prepublish === "absent") return [];
-        if (n === 3 && prepublish === "throws") throw new Error("relay down");
-        return [head];
-      });
-      relay.publish = async (event) => {
+  const NOW = 1_800_000_000;
+  const entry = (...keys) => ({
+    version: 1,
+    channels: Object.fromEntries(
+      keys.map((k) => [k, { [flag]: true, updatedAt: NOW - 100 }]),
+    ),
+  });
+  const keysOf = (event) =>
+    Object.keys(JSON.parse(event.content).channels).sort().join();
+
+  /**
+   * `recovery` is what the recovery read returns ("R", "undecodable" or
+   * nothing); `prepublish` is what the seed's pre-publish read sees.
+   */
+  async function run(t, { recovery, prepublish, signHead }) {
+    const lane = getLane();
+    const pk = `pk-union-${dTag}-${recovery}-${prepublish}-${!!signHead}`;
+    t.mock.method(Date, "now", () => NOW * 1000);
+    const R = relayEvent(pk, dTag, NOW + 30, entry("remote"), "0000-remote");
+    if (recovery === "undecodable") R.content = "not json";
+    let head = R;
+    const boot = deferred();
+    const read = deferred();
+    const manager = captureManager(t, lane[Manager]);
+    let inPreflight = false;
+    const preflight = lane[Manager].prototype.fetchOwnBlobBeforePublish;
+    t.mock.method(
+      lane[Manager].prototype,
+      "fetchOwnBlobBeforePublish",
+      async function (...args) {
+        inPreflight = true;
+        try {
+          return await preflight.apply(this, args);
+        } finally {
+          inPreflight = false;
+        }
+      },
+    );
+    const relay = setup(t, pk, (n) => {
+      if (n === 1) return boot.promise;
+      if (n === 2) return read.promise;
+      if (inPreflight && prepublish === "absent") return [];
+      if (inPreflight && prepublish === "throws") throw new Error("down");
+      return [head];
+    });
+    relay.publish = async (event) => {
+      if (
+        event.created_at > head.created_at ||
+        (event.created_at === head.created_at && event.id < head.id)
+      )
         head = event;
-      };
-      window.localStorage.setItem(
-        lane.storageKey(pk),
-        JSON.stringify(entry("seed")),
-      );
-      const { result } = renderHook(() => lane[name](pk, RELAY));
-      await until(() => relay.fetches === 2, "mount reads not in flight");
-      await act(async () => boot.resolve([]));
-      await until(
-        () => pendingOf(manager.current) != null,
-        "bootstrap did not seed",
-      );
-      await act(async () => recovery.resolve([R]));
+    };
+    const gate = signHead ? deferred() : null;
+    if (gate) holdAt(relay, "sign", gate.promise);
+    window.localStorage.setItem(
+      lane.storageKey(pk),
+      JSON.stringify(entry("seed")),
+    );
+    const first = renderHook(() => lane[name](pk, RELAY));
+    await until(() => relay.fetches === 2, "mount reads not in flight");
+    await act(async () => boot.resolve([]));
+    await until(() => pendingOf(manager.current) != null, "no seed");
+    await act(async () => read.resolve(recovery ? [R] : []));
+    await flush();
+    await tick(t, 2_000);
+    await flush();
+    if (gate) {
+      // A newer head lands while the R ∪ S union is being signed.
+      head = relayEvent(pk, dTag, NOW + 60, entry("remote", "newer"), "0-n");
+      await act(async () => relay.reconnect());
       await flush();
-      for (const ms of [2_000, 5_000, 10_000]) await tick(t, ms);
-      const both = "remote,seed";
-      await until(
-        () =>
-          [...result.current[ids]].sort().join() === both &&
-          Object.keys(
-            lane[`readChannel${flag === "starred" ? "Stars" : "Mutes"}Store`](
-              pk,
-            ).channels,
-          )
-            .sort()
-            .join() === both,
-        "local state lost an entry",
-      );
-      assert.ok(
-        JSON.parse(head.content).channels.remote,
-        "relay head lost the observed remote entry",
-      );
+      await act(async () => gate.resolve());
+      await flush();
+    }
+    for (const ms of [2_000, 5_000, 10_000, 30_000]) {
+      await tick(t, ms);
+      await flush();
+    }
+    first.unmount();
+    window.localStorage.clear(); // a fresh device: same identity, no cache
+    const second = renderHook(() => lane[name](pk, RELAY));
+    await flush();
+    return {
+      sent: relay.published.map(keysOf),
+      head: head === R && recovery === "undecodable" ? "R" : keysOf(head),
+      fresh: [...second.result.current[ids]].sort().join(),
+    };
+  }
+
+  for (const [label, opts] of [
+    ["prepublish returns R", { recovery: "R", prepublish: "R" }],
+    ["prepublish is the first observer of R", { prepublish: "R" }],
+    ["prepublish absent after R", { recovery: "R", prepublish: "absent" }],
+    ["prepublish throws after R", { recovery: "R", prepublish: "throws" }],
+  ]) {
+    test(`${name} seed publishes its union with R when ${label}`, async (t) => {
+      const { sent, head, fresh } = await run(t, opts);
+      assert.deepEqual(sent, ["remote,seed"], "seed sent without R");
+      assert.equal(head, "remote,seed", "relay head is not R ∪ S");
+      assert.equal(fresh, "remote,seed", "fresh device misses R ∪ S");
     });
   }
+
+  for (const prepublish of ["absent", "throws"]) {
+    test(`${name} seed unaware of R never replaces it (prepublish ${prepublish})`, async (t) => {
+      const { sent, head } = await run(t, { prepublish });
+      assert.deepEqual(sent, ["seed"], "expected the pre-R seed publish");
+      assert.equal(head, "remote", "a pre-R seed replaced R");
+    });
+  }
+
+  test(`${name} undecodable head abandons the seed`, async (t) => {
+    const { sent, head } = await run(t, {
+      recovery: "undecodable",
+      prepublish: "R",
+    });
+    assert.deepEqual(sent, [], "seed published over an undecodable head");
+    assert.equal(head, "R");
+  });
+
+  test(`${name} newer head during sign rebuilds the seed union`, async (t) => {
+    const { sent, head, fresh } = await run(t, {
+      recovery: "R",
+      prepublish: "R",
+      signHead: true,
+    });
+    assert.deepEqual(sent, ["newer,remote,seed"], "stale union published");
+    assert.equal(head, "newer,remote,seed");
+    assert.equal(fresh, "newer,remote,seed");
+  });
 }
 
 // ---------------------------------------------------------------------------

@@ -46,8 +46,13 @@ export class ChannelStarSyncManager {
   private lastRemoteCreatedAt: number;
   private pendingStore: ChannelStarStore | null = null;
   private lastPublishedStore: ChannelStarStore | null = null;
-  /** The bootstrap seed, queued because the relay had no head. */
+  /**
+   * The bootstrap seed, queued because the relay had no head, unioned with
+   * every head decoded since.  It may publish only while it holds the
+   * highest head observed (`seedHeadAt === lastRemoteCreatedAt`).
+   */
   private seedStore: ChannelStarStore | null = null;
+  private seedHeadAt = 0;
   private destroyed = false;
 
   constructor(pubkey: string, relayUrl: string) {
@@ -70,6 +75,7 @@ export class ChannelStarSyncManager {
       const event = events[0];
       this.recordRemoteHead(event.created_at);
       const result = await decryptAndParse(event);
+      this.foldIntoSeed(event.created_at, result, true);
       if (!result) {
         return { status: "failed", createdAt: event.created_at };
       }
@@ -89,16 +95,41 @@ export class ChannelStarSyncManager {
       this.lastRemoteCreatedAt = createdAt;
     }
     advanceWatermark(this.pubkey, BLOB_TYPE, this.relayUrl, createdAt);
-    // An observed head supersedes the absence-based seed, so it stops being
-    // pending: recovery must not keep skipping reads for a seed whose timer
-    // a remote apply may already have cancelled.  Real edits are untouched.
-    if (this.pendingStore !== null && this.pendingStore === this.seedStore) {
-      this.cancelPendingStarPublish();
-      this.pendingStore = null;
-    }
   }
 
+  /**
+   * Folds a decoded head into a pending seed so the seed never publishes
+   * without it.  A head that cannot be decoded cannot be folded, so the seed
+   * is abandoned rather than published over it.  `rearm` restarts the seed
+   * debounce for heads observed outside a publish.
+   */
+  private foldIntoSeed(
+    createdAt: number,
+    remote: RemoteStars | null,
+    rearm: boolean,
+  ): void {
+    const seed = this.seedStore;
+    if (seed === null || this.pendingStore !== seed) return;
+    if (createdAt <= this.seedHeadAt || createdAt < this.lastRemoteCreatedAt)
+      return;
+    if (!remote) {
+      this.clearTimer();
+      this.pendingStore = this.seedStore = null;
+      return;
+    }
+    this.seedStore = this.pendingStore = mergeStores(seed, remote.store);
+    this.seedHeadAt = createdAt;
+    if (rearm) this.publishStars(this.seedStore);
+  }
+
+  /** Remote applies supersede real edits; a seed already holds the head. */
   cancelPendingStarPublish(): void {
+    if (this.pendingStore !== null && this.pendingStore === this.seedStore)
+      return;
+    this.clearTimer();
+  }
+
+  private clearTimer(): void {
     if (this.debounceTimer !== null) {
       window.clearTimeout(this.debounceTimer);
       this.debounceTimer = null;
@@ -135,6 +166,7 @@ export class ChannelStarSyncManager {
       // Record the raw head before decrypt on the pre-publish path too.
       this.recordRemoteHead(event.created_at);
       const remote = await decryptAndParse(event);
+      this.foldIntoSeed(event.created_at, remote, false);
       if (!remote) return store;
       return mergeStores(store, remote.store);
     } catch {
@@ -161,19 +193,23 @@ export class ChannelStarSyncManager {
   }
 
   private async doPublish(store: ChannelStarStore): Promise<void> {
+    const seed = store === this.seedStore;
     try {
-      const merged = await this.fetchOwnBlobBeforePublish(store);
+      let merged = await this.fetchOwnBlobBeforePublish(store);
       // Guard: manager may have been destroyed while fetchOwnBlobBeforePublish
       // was awaited (community switch during in-flight fetch). If so, abort
       // before touching the relay.
       if (this.destroyed) return;
-      // The seed was queued only because the relay had no head (watermark
-      // 0).  Any head recorded since — recovery, live, or the read above —
-      // wins, so the seed is abandoned rather than published over it.
-      const seedSuperseded =
-        store === this.seedStore && this.lastRemoteCreatedAt > 0;
-      if (seedSuperseded || this.isIdenticalToLastPublished(merged)) {
-        if (this.pendingStore === store) this.pendingStore = null;
+      // A seed publishes only as its union with every observed head; an
+      // abandoned or not-yet-folded seed does not publish.
+      if (seed) {
+        if (!this.seedStore || this.seedHeadAt < this.lastRemoteCreatedAt)
+          return;
+        merged = mergeStores(merged, this.seedStore);
+      }
+      const owned = seed ? this.seedStore : store;
+      if (this.isIdenticalToLastPublished(merged)) {
+        if (this.pendingStore === owned) this.pendingStore = null;
         return;
       }
       const payload = {
@@ -196,19 +232,21 @@ export class ChannelStarSyncManager {
       });
       if (this.destroyed) return;
       // Re-check after the async encrypt/sign: a head recorded meanwhile
-      // still supersedes the seed.
-      if (store === this.seedStore && this.lastRemoteCreatedAt > 0) {
-        if (this.pendingStore === store) this.pendingStore = null;
+      // makes this union stale; its fold re-arms the seed.
+      if (
+        seed &&
+        (this.seedStore !== owned || this.seedHeadAt < this.lastRemoteCreatedAt)
+      )
         return;
-      }
       await relayClient.publishEvent(
         event,
         "Timed out publishing channel stars.",
         "Failed to publish channel stars.",
       );
+      if (seed) this.seedStore = null;
       this.recordRemoteHead(event.created_at);
       this.lastPublishedStore = merged;
-      if (this.pendingStore === store) this.pendingStore = null;
+      if (this.pendingStore === owned) this.pendingStore = null;
     } catch (error) {
       console.warn("[channelStarsSync] publish failed:", error);
     }
@@ -230,6 +268,8 @@ export class ChannelStarSyncManager {
         // still advances the watermark and blocks future seed-publish.
         this.recordRemoteHead(event.created_at);
         void decryptAndParse(event).then((result) => {
+          if (this.destroyed) return;
+          this.foldIntoSeed(event.created_at, result, true);
           if (result) {
             onUpdate(result);
           }
@@ -251,6 +291,7 @@ export class ChannelStarSyncManager {
       isLocalNonEmpty: (s) => Object.keys(s.channels).length > 0,
       publishFn: (s) => {
         this.seedStore = s;
+        this.seedHeadAt = 0;
         this.publishStars(s);
       },
     });
@@ -264,7 +305,7 @@ export class ChannelStarSyncManager {
     // singleton. Local entries survive because the apply/publish paths merge
     // per-entry via mergeStores, so no local work is permanently lost.
     this.destroyed = true;
-    this.cancelPendingStarPublish();
+    this.clearTimer();
     this.pendingStore = null;
   }
 }
