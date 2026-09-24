@@ -60,6 +60,8 @@ export class ChannelStarSyncManager {
   private lastRemoteCreatedAt: number;
   private pendingStore: ChannelStarStore | null = null;
   private lastPublishedStore: ChannelStarStore | null = null;
+  /** Event id of our publication of `lastPublishedStore`. */
+  private lastPublishedHeadId: string | null = null;
   /** The canonical relay head observed so far. */
   private head: HeadId | null = null;
   /**
@@ -158,12 +160,15 @@ export class ChannelStarSyncManager {
       this.arm(store, this.seedGen); // reconnect requeue keeps provenance
       return;
     }
-    // A real edit supersedes the seed: any seed job becomes obsolete.
+    // A real edit supersedes the seed: any seed job becomes obsolete, but the
+    // edit carries the seed's union forward (the edit's entries are newer).
+    let edit = store;
     if (this.seedStore !== null) {
+      edit = mergeStores(store, this.seedStore);
       this.seedStore = null;
       this.seedGen++;
     }
-    this.arm(store, null);
+    this.arm(edit, null);
   }
 
   /** `gen` is the seed generation a seed job was armed with; null for edits. */
@@ -200,7 +205,9 @@ export class ChannelStarSyncManager {
   }
 
   private isIdenticalToLastPublished(store: ChannelStarStore): boolean {
+    // Only our own publication at the canonical head represents the relay.
     if (!this.lastPublishedStore) return false;
+    if (this.head?.id !== this.lastPublishedHeadId) return false;
     const lastKeys = Object.keys(this.lastPublishedStore.channels);
     const currentKeys = Object.keys(store.channels);
     if (lastKeys.length !== currentKeys.length) return false;
@@ -263,6 +270,7 @@ export class ChannelStarSyncManager {
       );
       this.recordRemoteHead(event);
       this.lastPublishedStore = merged;
+      this.lastPublishedHeadId = event.id;
       this.settle(store, gen);
       // A newer seed generation (folded while this was in flight) must also
       // carry our own published head.

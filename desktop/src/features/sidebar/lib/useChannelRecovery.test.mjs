@@ -1454,22 +1454,214 @@ for (const [getLane, name, dTag, flag, Manager, ids, edit] of [
     assert.equal(out.pending, null, "newer seed stranded");
   });
 
-  test(`${name} real edit during an in-flight seed job still publishes`, async (t) => {
-    const pk = `pk-gen-edit-${dTag}`;
-    const out = await run(t, pk, async (c) => {
-      c.ctl.pre = deferred();
-      await recoverR(c);
-      await tick(t, 2_000); // seed job held in preflight
-      await flush();
-      await act(async () => c.first.result.current[edit]("user"));
-      c.relay.fetch = () => [c.ctl.head];
-      await act(async () => c.ctl.pre.resolve());
-      await flush();
-      await tick(t, 2_000); // the edit's own debounce; its preflight sees R
-      await flush();
+  for (const [variant, read] of [
+    ["returns R", (c) => [c.ctl.head]],
+    ["absent", () => []],
+    [
+      "throws",
+      () => {
+        throw new Error("read failed");
+      },
+    ],
+  ]) {
+    test(`${name} real edit over a pending seed keeps its union (preflight ${variant})`, async (t) => {
+      const pk = `pk-gen-edit-${variant}-${dTag}`;
+      const out = await run(t, pk, async (c) => {
+        c.ctl.pre = deferred();
+        await recoverR(c); // manager seed is R+S; React still holds only S
+        await tick(t, 2_000); // seed job held in preflight
+        await flush();
+        await act(async () => c.first.result.current[edit]("user"));
+        c.relay.fetch = () => read(c);
+        await act(async () => c.ctl.pre.resolve());
+        await flush();
+        await tick(t, 2_000); // the edit's own debounce
+        await flush();
+      });
+      assert.equal(out.head, "remote,seed,user", "edit dropped the seed union");
+      assert.equal(out.fresh, "remote,seed,user");
+      assert.equal(out.pending, null);
     });
-    assert.equal(out.head, "remote,seed,user", "real edit not published");
-    assert.equal(out.fresh, "remote,seed,user");
-    assert.equal(out.pending, null);
-  });
+  }
+}
+
+// Seed ownership: edit takeover, equal-union late ACK, generation-only fence.
+for (const [getLane, name, dTag, flag, Manager, ids, edit] of [
+  [
+    () => stars,
+    "useChannelStars",
+    "channel-stars",
+    "starred",
+    "ChannelStarSyncManager",
+    "starredChannelIds",
+    "starChannel",
+  ],
+  [
+    () => mutes,
+    "useChannelMutes",
+    "channel-mutes",
+    "muted",
+    "ChannelMuteSyncManager",
+    "mutedChannelIds",
+    "muteChannel",
+  ],
+]) {
+  for (const mode of [
+    "real-edit-absent",
+    "real-edit-throws",
+    "ack-identical-union",
+    "ack-identical-union-r2",
+    "generation-only-echo",
+  ]) {
+    test(`${name} ownership: ${mode}`, async (t) => {
+      const lane = getLane(),
+        NOW = 1800000000,
+        pk = `ownership-${dTag}-${mode}`;
+      t.mock.method(Date, "now", () => NOW * 1000);
+      const entries = (...keys) => ({
+        version: 1,
+        channels: Object.fromEntries(
+          keys.map((k) => [k, { [flag]: true, updatedAt: NOW }]),
+        ),
+      });
+      const keys = (e) =>
+        e ? Object.keys(JSON.parse(e.content).channels).sort().join() : "";
+      let head = relayEvent(
+        pk,
+        dTag,
+        NOW + 30,
+        entries("remote"),
+        "b".repeat(64),
+      );
+      const boot = deferred(),
+        read = deferred(),
+        gate = deferred();
+      const manager = captureManager(t, lane[Manager]);
+      const relay = setup(t, pk, (n) =>
+        n === 1 ? boot.promise : n === 2 ? read.promise : [],
+      );
+      let live,
+        preCount = 0,
+        encrypts = 0,
+        signs = 0,
+        submitted = 0;
+      relayClient.subscribeLive = async (_, cb) => {
+        live = cb;
+        return async () => {};
+      };
+      const pre = lane[Manager].prototype.fetchOwnBlobBeforePublish;
+      t.mock.method(
+        lane[Manager].prototype,
+        "fetchOwnBlobBeforePublish",
+        async function (...args) {
+          if (++preCount === 1 && mode.startsWith("real-edit"))
+            await gate.promise;
+          return pre.apply(this, args);
+        },
+      );
+      const invoke = window.__TAURI_INTERNALS__.invoke;
+      window.__TAURI_INTERNALS__.invoke = async (cmd, args) => {
+        if (
+          cmd === "nip44_encrypt_to_self" &&
+          ++encrypts === 1 &&
+          mode === "generation-only-echo"
+        )
+          await gate.promise;
+        if (cmd === "sign_event") {
+          const n = ++signs;
+          const event = JSON.parse(await invoke(cmd, args));
+          event.id = n.toString(16).padStart(64, "0");
+          return JSON.stringify(event);
+        }
+        return invoke(cmd, args);
+      };
+      const sends = [];
+      relay.publish = async (event) => {
+        submitted++;
+        sends.push({ keys: keys(event), at: event.created_at, id: event.id });
+        if (
+          !head ||
+          event.created_at > head.created_at ||
+          (event.created_at === head.created_at && event.id < head.id)
+        )
+          head = event;
+        if (mode.startsWith("ack-identical-union") && submitted === 1)
+          await gate.promise;
+        if (mode === "generation-only-echo") live(event);
+      };
+      window.localStorage.setItem(
+        lane.storageKey(pk),
+        JSON.stringify(entries("seed")),
+      );
+      const first = renderHook(() => lane[name](pk, RELAY));
+      await until(() => relay.fetches === 2, "mount reads");
+      await act(async () => boot.resolve([]));
+      await until(() => pendingOf(manager.current) != null, "seed");
+      await act(async () => read.resolve(head ? [head] : []));
+      await flush();
+      await tick(t, 2000);
+      await flush();
+      if (mode.startsWith("real-edit")) {
+        await act(async () => first.result.current[edit]("user"));
+        await flush();
+        relay.fetch = () => {
+          if (mode.endsWith("throws")) throw new Error("read failed");
+          return [];
+        };
+        await act(async () => gate.resolve());
+        await flush();
+      } else if (mode.startsWith("ack-identical-union")) {
+        head = relayEvent(
+          pk,
+          dTag,
+          NOW + 60,
+          entries("remote"),
+          "c".repeat(64),
+        );
+        await act(async () => live(head));
+        await flush();
+        await act(async () => gate.resolve());
+        await flush();
+      } else if (mode === "generation-only-echo") {
+        await act(async () => first.result.current[edit]("user"));
+        await flush();
+        relay.fetch = () => (head ? [head] : []);
+        await act(async () => gate.resolve());
+        await flush();
+      }
+      if (mode === "ack-identical-union-r2") relay.fetch = () => [head];
+      for (const ms of [2000, 5000, 10000, 30000]) {
+        await tick(t, ms);
+        await flush();
+      }
+      const pending = pendingOf(manager.current),
+        m = manager.current;
+      const output = {
+        dTag,
+        mode,
+        sends,
+        retained: keys(head),
+        pending: pending ? Object.keys(pending.channels).sort().join() : null,
+        seed: m.seedStore
+          ? Object.keys(m.seedStore.channels).sort().join()
+          : null,
+        gen: m.seedGen,
+        seedHead: m.seedHead,
+        head: m.head,
+      };
+      first.unmount();
+      window.localStorage.clear();
+      relay.fetch = () => (head ? [head] : []);
+      const second = renderHook(() => lane[name](pk, RELAY));
+      await flush();
+      output.fresh = [...second.result.current[ids]].sort().join();
+      const want =
+        mode.startsWith("real-edit") || mode === "generation-only-echo"
+          ? "remote,seed,user"
+          : "remote,seed";
+      assert.equal(output.retained, want, "retained head lost intended union");
+      assert.equal(output.fresh, want, "fresh device misses intended union");
+      assert.equal(output.pending, null, "pending stranded");
+    });
+  }
 }
